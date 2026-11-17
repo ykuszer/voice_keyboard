@@ -9,7 +9,11 @@ while focus stays exactly where it was.
 
 That same choice is why the card is dragged rather than moved by the
 compositor: a layer surface has no title bar and hyprland will not move it, so
-position is a pair of margins this file maintains, and dragging edits them.
+the position is this file's business. The surface therefore covers the whole
+usable screen and the card is placed inside it, with the input region clipped
+to the card so everything around it still belongs to the windows underneath.
+That is what makes dragging work: pointer events are measured against the
+surface, and this surface never moves.
 
 Inference happens on one worker thread, not a pool, because the order the
 utterances were spoken in is the order they have to be typed in -- and because
@@ -28,6 +32,7 @@ import signal
 import threading
 import time
 
+import cairo
 import gi
 
 gi.require_version("Gdk", "3.0")
@@ -59,10 +64,6 @@ LANGUAGES = [
 # the display then says "dead" about a microphone that is merely quiet, which
 # is exactly the wrong thing to tell someone whose dictation is not working.
 METER_FLOOR_DB = -60.0
-
-# Roughly 60Hz. Each move costs about 0.08ms, so what this paces is the
-# compositor's willingness to reconfigure the surface, not our own work.
-DRAG_INTERVAL_MS = 16
 
 
 def _state_path() -> pathlib.Path:
@@ -135,14 +136,27 @@ class VoiceKeyboard:
         # whatever window the user is actually typing into.
         GtkLayerShell.set_keyboard_mode(self.window, GtkLayerShell.KeyboardMode.NONE)
 
-        # Anchored to two edges, always, so that position is just a pair of
-        # margins. Anchoring to one edge would let the compositor centre the
-        # card on the other axis and there would be nothing to drag.
-        GtkLayerShell.set_anchor(self.window, GtkLayerShell.Edge.LEFT, True)
-        GtkLayerShell.set_anchor(self.window, GtkLayerShell.Edge.TOP, True)
-
-        self.margin_x, self.margin_y = self._initial_position()
-        self._apply_margins()
+        # Anchored to all four edges, so the surface is the whole usable
+        # screen and moving the card is moving a widget inside it. The
+        # obvious alternative -- a card-sized surface moved by its
+        # layer-shell margins -- cannot be dragged correctly: pointer
+        # positions arrive relative to the surface, so moving the surface
+        # moves the frame the next event is measured in. Events already in
+        # flight then describe a position that no longer exists, and
+        # applying them compounds. Measured on hyprland, a 320px pointer
+        # drag threw the card 1220px across the screen that way.
+        #
+        # No exclusive zone is set, which keeps the surface inside the
+        # bars' reserved space -- the same frame the margins were measured
+        # in, so a position saved by the older build still means the place
+        # it meant then.
+        for edge in (
+            GtkLayerShell.Edge.LEFT,
+            GtkLayerShell.Edge.TOP,
+            GtkLayerShell.Edge.RIGHT,
+            GtkLayerShell.Edge.BOTTOM,
+        ):
+            GtkLayerShell.set_anchor(self.window, edge, True)
 
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         card.get_style_context().add_class("vk-card")
@@ -153,113 +167,141 @@ class VoiceKeyboard:
 
         # An event box, because a Gtk.Box has no window of its own to collect
         # pointer events on.
-        frame = Gtk.EventBox()
-        frame.add(card)
-        frame.add_events(
+        self.frame = Gtk.EventBox()
+        self.frame.add(card)
+        self.frame.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
             | Gdk.EventMask.POINTER_MOTION_MASK
         )
-        frame.connect("button-press-event", self._on_drag_begin)
-        frame.connect("button-release-event", self._on_drag_end)
-        frame.connect("motion-notify-event", self._on_drag_motion)
-        self._drag_from: tuple[float, float] | None = None
-        self._drag_to: tuple[float, float] | None = None
-        self._drag_tick: int | None = None
+        self.frame.connect("button-press-event", self._on_drag_begin)
+        self.frame.connect("button-release-event", self._on_drag_end)
+        self.frame.connect("motion-notify-event", self._on_drag_motion)
+        self._grab: tuple[float, float] | None = None
 
-        self.window.add(frame)
+        # Gtk.Fixed, because the point of the screen-sized surface is to put
+        # the card at a position of our choosing within it.
+        self.layout = Gtk.Fixed()
+        self.layout.put(self.frame, 0, 0)
+        self.window.add(self.layout)
+
+        # The card's height follows the text in it, and the surface's size is
+        # whatever the compositor says it is -- which it says after the
+        # window has already been allocated once at the card's own size.
+        # Neither the position nor the input region can be settled at
+        # startup, so both are redone whenever either size changes.
+        self._sizes: tuple[tuple[int, int], tuple[int, int]] | None = None
+        saved = self._saved_position()
+        self._positioned = saved is not None
+        self.card_x, self.card_y = saved or (0.0, 0.0)
+        self._at = (0, 0)
+        self.frame.connect("size-allocate", self._on_size_allocate)
+        self.window.connect("size-allocate", self._on_size_allocate)
+
+        # Until the first allocation the card's size is unknown, so the
+        # region that should be clipped to it is not known either. An empty
+        # region for those few milliseconds lets clicks through, which is the
+        # harmless way to be wrong: the other way swallows every click on the
+        # desktop.
+        self.window.connect(
+            "realize", lambda w: w.get_window().input_shape_combine_region(cairo.Region(), 0, 0)
+        )
+
         self._load_css()
         self.window.show_all()
 
-    def _monitor_geometry(self) -> Gdk.Rectangle:
-        display = Gdk.Display.get_default()
-        monitor = display.get_primary_monitor() or display.get_monitor(0)
-        return monitor.get_geometry()
-
-    def _initial_position(self) -> tuple[int, int]:
-        """Where the card starts: where it was left, or centred on the edge."""
+    def _saved_position(self) -> tuple[float, float] | None:
+        """Where the card was left, or nothing if it has never been moved."""
         saved = self._state.get("position")
         if isinstance(saved, list) and len(saved) == 2:
-            return int(saved[0]), int(saved[1])
+            return float(saved[0]), float(saved[1])
+        return None
 
-        area = self._monitor_geometry()
-        x = max(0, (area.width - self.opts.width) // 2)
-        # The height is not known until the card is realised, so approximate;
-        # being a few pixels out on first run costs nothing and the position
-        # is saved the moment it is dragged.
-        y = self.opts.margin if self.opts.position == "top" else area.height - 150 - self.opts.margin
+    def _default_position(self, area, card) -> tuple[float, float]:
+        """Centred on the chosen edge, at the requested margin."""
+        x = max(0, (area[0] - card[0]) // 2)
+        y = self.opts.margin if self.opts.position == "top" else area[1] - card[1] - self.opts.margin
         return x, max(0, y)
 
-    def _apply_margins(self) -> None:
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.LEFT, int(self.margin_x))
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(self.margin_y))
-        # A new margin only reaches the compositor when the surface is
-        # committed, and GTK commits when it draws. Nothing about moving the
-        # card dirties a widget, so without asking for a draw the margins
-        # change in memory and the card sits exactly where it was.
-        self.window.queue_draw()
+    def _on_size_allocate(self, _widget, _allocation) -> None:
+        window = self.window.get_allocation()
+        card = self.frame.get_allocation()
+        sizes = ((window.width, window.height), (card.width, card.height))
+        # Placing the card allocates it again, so without this the handler
+        # would call itself for as long as GTK let it.
+        if sizes == self._sizes:
+            return
+        self._sizes = sizes
+        if not self._positioned:
+            # A card nobody has placed belongs where this was asked to put
+            # it, and goes on belonging there as the screen changes under it.
+            # This is also what gets the first placement right: GTK allocates
+            # the window at the card's own size before the compositor says
+            # how big the surface really is, and a default worked out in that
+            # moment would put the card in the corner.
+            self.card_x, self.card_y = self._default_position(*sizes)
+        self._place_card()
+
+    def _place_card(self) -> None:
+        """Put the card where it belongs, and the input region on top of it."""
+        (area_w, area_h), (card_w, card_h) = self._sizes
+        # Clamped to the screen when it is drawn, not when it is chosen. The
+        # wanted position outlives a screen it does not currently fit on --
+        # and the first allocation is one of those, since the surface is
+        # still the size of the card at that point.
+        self._at = (
+            int(min(max(0.0, self.card_x), max(0, area_w - card_w))),
+            int(min(max(0.0, self.card_y), max(0, area_h - card_h))),
+        )
+        self.layout.move(self.frame, *self._at)
+
+        # The surface is the size of the screen, so without clipping the
+        # input region to the card it would eat every click on the desktop.
+        # That is the one failure mode of a surface this big, and the reason
+        # the region is set here rather than once: it has to follow the card.
+        surface = self.window.get_window()
+        if surface is not None:
+            rect = cairo.RectangleInt(self._at[0], self._at[1], card_w, card_h)
+            surface.input_shape_combine_region(cairo.Region(rect), 0, 0)
 
     # --- dragging ----------------------------------------------------------
 
     def _on_drag_begin(self, _widget, event) -> bool:
         if event.button != 1:
             return False
-        self._drag_from = (event.x, event.y)
-        # A plain timer, not the frame clock. Updates do have to be paced --
-        # every move shifts the coordinate frame the next event is measured
-        # in, so acting per event means acting on stale positions. But the
-        # frame clock paces them far too slowly: changing a layer-shell
-        # margin dirties no widget, so GTK schedules no redraw, so
-        # add_tick_callback barely runs. Measured 5 ticks against 11 motion
-        # events, where a timer gives 164 over the same couple of seconds.
-        if self._drag_tick is None:
-            self._drag_tick = GLib.timeout_add(DRAG_INTERVAL_MS, self._on_drag_tick)
+        # Surface coordinates, not widget ones. The widget moves with the
+        # card and would measure the drag against its own moving self; the
+        # surface stays where it is. What is kept is where in the card the
+        # pointer took hold of it, which is what has to stay true while it
+        # moves.
+        self._grab = (event.x_root - self._at[0], event.y_root - self._at[1])
+        self._positioned = True
         return False
 
     def _on_drag_end(self, _widget, _event) -> bool:
-        if self._drag_from is None:
+        if self._grab is None:
             return False
-        self._drag_from = None
-        self._drag_to = None
-        if self._drag_tick is not None:
-            GLib.source_remove(self._drag_tick)
-            self._drag_tick = None
-        self._state["position"] = [int(self.margin_x), int(self.margin_y)]
+        self._grab = None
+        # Where it ended up rather than where the pointer went: a drag off
+        # the edge of the screen should not be remembered as a position off
+        # the edge of the screen.
+        self._state["position"] = list(self._at)
         self._save_state()
         return False
 
-    def _on_drag_tick(self) -> bool:
-        """Apply at most one move per frame, from the latest pointer position."""
-        if self._drag_from is None:
-            return GLib.SOURCE_REMOVE
-        if self._drag_to is None:
-            return GLib.SOURCE_CONTINUE
-
-        dx, dy = self._drag_to
-        self._drag_to = None
-        if not dx and not dy:
-            return GLib.SOURCE_CONTINUE
-
-        area = self._monitor_geometry()
-        allocation = self.window.get_allocation()
-        self.margin_x = min(max(0, self.margin_x + dx), max(0, area.width - allocation.width))
-        self.margin_y = min(max(0, self.margin_y + dy), max(0, area.height - allocation.height))
-        self._apply_margins()
-        return GLib.SOURCE_CONTINUE
-
     def _on_drag_motion(self, _widget, event) -> bool:
-        """Record where the pointer is; the frame clock does the moving.
+        """Put the card where the pointer is, every event, no pacing.
 
-        Wayland hands out no absolute pointer position, so this works in
-        deltas within the surface: how far the pointer has drifted from the
-        point it grabbed. Replacing rather than accumulating is deliberate --
-        until the card actually moves, every event measures the same total
-        displacement, so the newest reading is the whole truth and the older
-        ones are not increments to add to it.
+        Each event carries the pointer's position in the surface rather than
+        a delta, so there is nothing to accumulate and nothing to go stale:
+        acting on an event that has been overtaken costs one redundant move,
+        not a wrong position. Each move costs about 0.08ms.
         """
-        if self._drag_from is None:
+        if self._grab is None:
             return False
-        self._drag_to = (event.x - self._drag_from[0], event.y - self._drag_from[1])
+        self.card_x = event.x_root - self._grab[0]
+        self.card_y = event.y_root - self._grab[1]
+        self._place_card()
         return True
 
     # --- rows --------------------------------------------------------------
@@ -388,6 +430,16 @@ class VoiceKeyboard:
         return box
 
     def _load_css(self) -> None:
+        # The surface is the size of the screen, so a painted window
+        # background would be a sheet of theme colour over the desktop. This
+        # is not left to the stylesheet: --css is optional, and the one rule
+        # the layout depends on cannot be.
+        base = Gtk.CssProvider()
+        base.load_from_data(b"window { background: transparent; }")
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), base, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
         if not self.opts.css:
             return
         provider = Gtk.CssProvider()
@@ -529,6 +581,10 @@ class VoiceKeyboard:
         # card was hidden is simply there.
         self._reload_sources()
         self.window.show_all()
+        # Hiding tears the wl_surface down, so the clipped input region goes
+        # with it and has to be put back on the new one.
+        if self._sizes is not None:
+            self._place_card()
         self._set_status("idle")
 
     def hide(self) -> None:

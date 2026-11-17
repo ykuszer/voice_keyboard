@@ -614,8 +614,13 @@ bidi = lib.mkOption {
           bind = lib.optional (cfg.toggleKey != null) "${cfg.toggleKey}, exec, ${lib.getExe toggle}";
 
           # Matches the namespace ui.py sets on the layer surface.
+          #
+          # fade, not popin: the surface is the size of the screen and the
+          # card is placed inside it, so scaling the surface would swing the
+          # card in from somewhere it never was. ignore_alpha keeps the blur
+          # on the card rather than under the whole transparent sheet.
           layerrule = [
-            "blur on, ignore_alpha 0.1, animation popin 92%, match:namespace voice-keyboard"
+            "blur on, ignore_alpha 0.1, animation fade, match:namespace voice-keyboard"
           ];
         };
       })
