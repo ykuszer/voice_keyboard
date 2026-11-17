@@ -60,6 +60,10 @@ LANGUAGES = [
 # is exactly the wrong thing to tell someone whose dictation is not working.
 METER_FLOOR_DB = -60.0
 
+# Roughly 60Hz. Each move costs about 0.08ms, so what this paces is the
+# compositor's willingness to reconfigure the surface, not our own work.
+DRAG_INTERVAL_MS = 16
+
 
 def _state_path() -> pathlib.Path:
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
@@ -189,6 +193,11 @@ class VoiceKeyboard:
     def _apply_margins(self) -> None:
         GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.LEFT, int(self.margin_x))
         GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(self.margin_y))
+        # A new margin only reaches the compositor when the surface is
+        # committed, and GTK commits when it draws. Nothing about moving the
+        # card dirties a widget, so without asking for a draw the margins
+        # change in memory and the card sits exactly where it was.
+        self.window.queue_draw()
 
     # --- dragging ----------------------------------------------------------
 
@@ -196,13 +205,15 @@ class VoiceKeyboard:
         if event.button != 1:
             return False
         self._drag_from = (event.x, event.y)
-        # Move on the frame clock rather than on the event. Pointer motion
-        # arrives faster than the compositor will reconfigure the surface, and
+        # A plain timer, not the frame clock. Updates do have to be paced --
         # every move shifts the coordinate frame the next event is measured
-        # in -- so moving per event means acting on stale positions, and the
-        # card stutters as it fights its own backlog.
+        # in, so acting per event means acting on stale positions. But the
+        # frame clock paces them far too slowly: changing a layer-shell
+        # margin dirties no widget, so GTK schedules no redraw, so
+        # add_tick_callback barely runs. Measured 5 ticks against 11 motion
+        # events, where a timer gives 164 over the same couple of seconds.
         if self._drag_tick is None:
-            self._drag_tick = self.window.add_tick_callback(self._on_drag_tick)
+            self._drag_tick = GLib.timeout_add(DRAG_INTERVAL_MS, self._on_drag_tick)
         return False
 
     def _on_drag_end(self, _widget, _event) -> bool:
@@ -211,13 +222,13 @@ class VoiceKeyboard:
         self._drag_from = None
         self._drag_to = None
         if self._drag_tick is not None:
-            self.window.remove_tick_callback(self._drag_tick)
+            GLib.source_remove(self._drag_tick)
             self._drag_tick = None
         self._state["position"] = [int(self.margin_x), int(self.margin_y)]
         self._save_state()
         return False
 
-    def _on_drag_tick(self, _widget, _clock) -> bool:
+    def _on_drag_tick(self) -> bool:
         """Apply at most one move per frame, from the latest pointer position."""
         if self._drag_from is None:
             return GLib.SOURCE_REMOVE
