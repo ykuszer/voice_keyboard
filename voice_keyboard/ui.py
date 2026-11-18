@@ -191,6 +191,7 @@ class VoiceKeyboard:
         # Neither the position nor the input region can be settled at
         # startup, so both are redone whenever either size changes.
         self._sizes: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._placement_pending = False
         saved = self._saved_position()
         self._positioned = saved is not None
         self.card_x, self.card_y = saved or (0.0, 0.0)
@@ -240,7 +241,16 @@ class VoiceKeyboard:
             # how big the surface really is, and a default worked out in that
             # moment would put the card in the corner.
             self.card_x, self.card_y = self._default_position(*sizes)
+        # Gtk.Fixed.move() queues a resize. During size-allocate GTK can
+        # discard that request, leaving the frame at its previous position.
+        if not self._placement_pending:
+            self._placement_pending = True
+            GLib.idle_add(self._place_after_allocation)
+
+    def _place_after_allocation(self) -> bool:
+        self._placement_pending = False
         self._place_card()
+        return GLib.SOURCE_REMOVE
 
     def _place_card(self) -> None:
         """Put the card where it belongs, and the input region on top of it."""
@@ -278,13 +288,16 @@ class VoiceKeyboard:
         self._positioned = True
         return False
 
-    def _on_drag_end(self, _widget, _event) -> bool:
-        if self._grab is None:
+    def _on_drag_end(self, _widget, event) -> bool:
+        if event.button != 1 or self._grab is None:
             return False
+        # GTK may coalesce motion events before the release.
+        self._drag_to(event)
         self._grab = None
         # Where it ended up rather than where the pointer went: a drag off
         # the edge of the screen should not be remembered as a position off
         # the edge of the screen.
+        self.card_x, self.card_y = self._at
         self._state["position"] = list(self._at)
         self._save_state()
         return False
@@ -299,23 +312,43 @@ class VoiceKeyboard:
         """
         if self._grab is None:
             return False
+        if not event.state & Gdk.ModifierType.BUTTON1_MASK:
+            self._grab = None
+            return False
+        self._drag_to(event)
+        return True
+
+    def _drag_to(self, event) -> None:
         self.card_x = event.x_root - self._grab[0]
         self.card_y = event.y_root - self._grab[1]
         self._place_card()
-        return True
 
     # --- rows --------------------------------------------------------------
 
     def _build_header(self) -> Gtk.Box:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
+        handle = Gtk.EventBox()
+        handle.set_above_child(True)
+        handle.set_tooltip_text("Drag to move")
+        handle.connect(
+            "realize",
+            lambda widget: widget.get_window().set_cursor(
+                Gdk.Cursor.new_from_name(widget.get_display(), "move")
+            ),
+        )
+        grip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        grip.add(Gtk.Label(label="⠿"))
+        handle.add(grip)
+        row.pack_start(handle, True, True, 0)
+
         self.dot = Gtk.Label(label="●")
         self.dot.get_style_context().add_class("vk-dot")
-        row.pack_start(self.dot, False, False, 0)
+        grip.pack_start(self.dot, False, False, 0)
 
         self.status = Gtk.Label(label="Idle", xalign=0.0)
         self.status.get_style_context().add_class("vk-status")
-        row.pack_start(self.status, False, False, 0)
+        grip.pack_start(self.status, False, False, 0)
 
         # Hiding, not quitting: the model stays loaded and the same keybind
         # brings the card back instantly.
@@ -588,6 +621,7 @@ class VoiceKeyboard:
         self._set_status("idle")
 
     def hide(self) -> None:
+        self._grab = None
         self.stop()
         self.window.hide()
 

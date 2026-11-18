@@ -16,6 +16,7 @@
   glib,
   pango,
   gdk-pixbuf,
+  librsvg,
   atk,
   harfbuzz,
   gobject-introspection,
@@ -80,6 +81,7 @@ writeShellApplication {
   # Defaults are passed before "$@" so that anything baked in here can still
   # be overridden on the command line: argparse keeps the last occurrence.
   text = ''
+    export GDK_PIXBUF_MODULE_FILE=${librsvg}/${gdk-pixbuf.binaryDir}/loaders.cache
     export GI_TYPELIB_PATH=${
       lib.makeSearchPath "lib/girepository-1.0" [
         gtk3
